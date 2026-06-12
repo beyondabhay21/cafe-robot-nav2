@@ -30,5 +30,5 @@ setup(
             'robot = cafe_robot.main_robot:main',
 
         ],
-    },
+    },  
 )
