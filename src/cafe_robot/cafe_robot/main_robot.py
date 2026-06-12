@@ -1,10 +1,13 @@
+import time
+
 import rclpy
 from rclpy.node import Node
-
+import threading
 from std_msgs.msg import String
 from std_msgs.msg import Bool
 
 from cafe_robot.robot_states import RobotState
+from cafe_robot.order_queue import OrderQueue
 
 
 class MainRobot(Node):
@@ -15,7 +18,9 @@ class MainRobot(Node):
 
         self.state = RobotState.IDLE
 
-        self.orders = []
+        self.queue = OrderQueue()
+
+        self.processing = False
 
         self.cancelled = False
 
@@ -23,7 +28,6 @@ class MainRobot(Node):
 
         self.table_confirmed = False
 
-        # Order subscriber
         self.create_subscription(
             String,
             "/order",
@@ -31,7 +35,6 @@ class MainRobot(Node):
             10
         )
 
-        # Confirmation subscriber
         self.create_subscription(
             Bool,
             "/confirm",
@@ -39,7 +42,6 @@ class MainRobot(Node):
             10
         )
 
-        # Cancel subscriber
         self.create_subscription(
             Bool,
             "/cancel",
@@ -51,30 +53,39 @@ class MainRobot(Node):
             "Cafe Robot Ready"
         )
 
-    # -------------------------
+    # ----------------------------------
     # Callbacks
-    # -------------------------
+    # ----------------------------------
 
     def order_callback(self, msg):
 
         table = msg.data
 
-        self.orders.append(table)
+        self.queue.add(table)
 
         self.get_logger().info(
             f"Order received for {table}"
         )
 
-        self.run_delivery(table)
+        if self.state == RobotState.IDLE:
+
+            threading.Thread(
+                target=self.process_orders,
+                daemon=True
+            ).start()
 
     def confirm_callback(self, msg):
+
+        self.get_logger().info(
+            f"Confirm received: {msg.data}"
+        )
 
         if self.state == RobotState.WAIT_KITCHEN:
 
             self.kitchen_confirmed = msg.data
 
             self.get_logger().info(
-                "Kitchen confirmed"
+                "Kitchen confirmation accepted"
             )
 
         elif self.state == RobotState.WAIT_TABLE:
@@ -82,7 +93,13 @@ class MainRobot(Node):
             self.table_confirmed = msg.data
 
             self.get_logger().info(
-                "Table confirmed"
+                "Table confirmation accepted"
+            )
+
+        else:
+
+            self.get_logger().warn(
+                f"Confirmation ignored. Current state: {self.state.value}"
             )
 
     def cancel_callback(self, msg):
@@ -95,9 +112,28 @@ class MainRobot(Node):
                 "Order cancelled"
             )
 
-    # -------------------------
+    # ----------------------------------
+    # Order Processing
+    # ----------------------------------
+
+    def process_orders(self):
+
+        if self.processing:
+            return
+
+        self.processing = True
+
+        while not self.queue.empty():
+
+            table = self.queue.next_order()
+
+            self.run_delivery(table)
+
+        self.processing = False
+
+    # ----------------------------------
     # Delivery Logic
-    # -------------------------
+    # ----------------------------------
 
     def run_delivery(self, table):
 
@@ -107,7 +143,9 @@ class MainRobot(Node):
 
         self.table_confirmed = False
 
-        # Home -> Kitchen
+        # -------------------
+        # Kitchen
+        # -------------------
 
         self.state = RobotState.TO_KITCHEN
 
@@ -119,29 +157,19 @@ class MainRobot(Node):
             "Reached kitchen"
         )
 
-        # Wait Kitchen
-
         self.state = RobotState.WAIT_KITCHEN
 
         self.get_logger().info(
             "Waiting for kitchen confirmation"
         )
 
-        # For now simulate confirmation
-
-        self.kitchen_confirmed = True
-
-        if not self.kitchen_confirmed:
-
-            self.get_logger().warn(
-                "Kitchen timeout"
-            )
-
-            self.return_home()
+        if not self.wait_for_kitchen():
 
             return
 
-        # Kitchen -> Table
+        # -------------------
+        # Table
+        # -------------------
 
         self.state = RobotState.TO_TABLE
 
@@ -153,45 +181,85 @@ class MainRobot(Node):
             f"Reached {table}"
         )
 
-        # Wait Table
-
         self.state = RobotState.WAIT_TABLE
 
         self.get_logger().info(
             "Waiting for table confirmation"
         )
 
-        # For now simulate confirmation
-
-        self.table_confirmed = True
-
-        if not self.table_confirmed:
-
-            self.get_logger().warn(
-                "Table timeout"
-            )
-
-            self.return_kitchen()
-
-            self.return_home()
+        if not self.wait_for_table():
 
             return
 
-        # Check cancellation
-
-        if self.cancelled:
-
-            self.return_home()
-
-            return
-
-        # Return Home
+        # -------------------
+        # Success
+        # -------------------
 
         self.return_home()
 
-    # -------------------------
-    # Helpers
-    # -------------------------
+    # ----------------------------------
+    # Wait Helpers
+    # ----------------------------------
+
+    def wait_for_kitchen(self):
+
+        timeout = 60
+
+        start_time = time.time()
+
+        while not self.kitchen_confirmed:
+
+            if self.cancelled:
+
+                self.return_home()
+                return False
+
+            if time.time() - start_time > timeout:
+
+                self.get_logger().warn(
+                    "Kitchen timeout"
+                )
+
+                self.return_home()
+
+                return False
+
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        return True
+
+    def wait_for_table(self):
+
+        timeout = 60
+
+        start_time = time.time()
+
+        while not self.table_confirmed:
+
+            if self.cancelled:
+
+                self.return_home()
+                return False
+
+            if time.time() - start_time > timeout:
+
+                self.get_logger().warn(
+                    "Table timeout"
+                )
+
+                self.return_kitchen()
+
+                self.return_home()
+
+                return False
+
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+        return True
+
+    # ----------------------------------
+    # Navigation Helpers
+    # ----------------------------------
 
     def return_kitchen(self):
 
